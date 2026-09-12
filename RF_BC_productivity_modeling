@@ -88,7 +88,7 @@ for p in barplot.patches:
              f'{width:.1f}%', ha="left", va="center", fontsize=10, color='black')
 
 # Embed a professional text box with R2 and MAE metrics in the bottom right corner.
-metrics_text = f"$R^2 = {r2:.3f}$\n$MAE = {mae:.3f}$ g/L"
+metrics_text = f"$R^2 = {r2:.3f}$\n$MAE = {mae:.3f}$ mg/(L*h)"
 plt.gca().text(0.95, 0.05, metrics_text,
                transform=plt.gca().transAxes,
                fontsize=12, 
