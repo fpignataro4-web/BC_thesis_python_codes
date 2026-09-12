@@ -1,0 +1,193 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import r2_score, mean_absolute_error
+import os
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# =====================================================================
+# 1. "ZERO FRICTION" DATA EXTRACTION (INSERITA TEMPERATURA MEDIA)
+# =====================================================================
+file_path = 'data_10_master_final.xlsx'
+temp_file_path = 'ML_Ready_BC_Dataset.xlsx' # Il tuo nuovo file!
+
+try:
+    df_ts = pd.read_excel(file_path, sheet_name='time_series')
+    df_meta = pd.read_excel(file_path, sheet_name='metadata')
+    df_temp = pd.read_excel(temp_file_path) # Caricamento automatico
+except Exception as e:
+    raise RuntimeError(f"Errore nella lettura. Assicurati che i file siano presenti: {e}")
+
+# Estrazione dati a t=0
+df_t0 = df_ts[df_ts['Time_h'] == 0].copy()
+df_t0['pH_initial'] = df_t0['pH_offline'].fillna(df_t0.get('pH_online', np.nan))
+
+# Includiamo le feature chimico-fisiche selezionate
+features_to_keep = [
+    'Batch_id', 'brix_offline', 'TPC_mg_ml_offline',
+    'pH_initial'
+]
+features_to_keep = [col for col in features_to_keep if col in df_t0.columns]
+df_t0_features = df_t0[features_to_keep]
+
+df_meta_features = df_meta[['Batch_id', 'BC_yield_g_L', 'OD_inoculum', 'Substrate']]
+
+# Merge progressivo: t0 -> metadata -> temperature
+df_ml = pd.merge(df_t0_features, df_meta_features, on='Batch_id', how='inner')
+df_ml = pd.merge(df_ml, df_temp[['Batch_id', 'Average_Temp']], on='Batch_id', how='inner')
+df_ml = df_ml.dropna(subset=['BC_yield_g_L'])
+
+# Mappatura Substrati per Colori (Scatter Plot)
+df_ml['Substrate'] = df_ml['Substrate'].str.strip()
+substrate_clean_map = {
+    'Tea_250 g': 'Control Tea',
+    'Tea_100g': 'Low Sugar Tea',
+    'Pineapple_juice': 'Pineapple Juice',
+    'Blackbarry_wastes': 'Blackberry Wastes'
+}
+df_ml['Substrate_Group'] = df_ml['Substrate'].map(substrate_clean_map).fillna(df_ml['Substrate'])
+
+X = df_ml.drop(columns=['Batch_id', 'BC_yield_g_L', 'Substrate', 'Substrate_Group']).fillna(df_ml.mean(numeric_only=True))
+y = df_ml['BC_yield_g_L']
+
+# =====================================================================
+# 2. MODELLO RIDGE REGRESSION SUTHERLAND (CORE + TEMPERATURE)
+# =====================================================================
+ml_pipeline = Pipeline([
+    ('scaler', StandardScaler()),
+    ('ridge', Ridge(alpha=0.1, random_state=42))
+])
+
+ml_pipeline.fit(X, y)
+y_pred = ml_pipeline.predict(X)
+
+r2 = r2_score(y, y_pred)
+mae = mean_absolute_error(y, y_pred)
+
+# Estrazione importanze percentuali dai coefficienti assoluti
+ridge_model = ml_pipeline.named_steps['ridge']
+abs_coefs = np.abs(ridge_model.coef_)
+importances = (abs_coefs / np.sum(abs_coefs)) * 100
+
+df_importance = pd.DataFrame({'Feature': X.columns, 'Importance': importances})
+df_importance = df_importance.sort_values(by='Importance', ascending=False)
+
+# Aggiunta l'etichetta per la temperatura media!
+label_mapping = {
+    'brix_offline': 'Initial Sugar (°Bx)',
+    'TPC_mg_ml_offline': 'Initial TPC (GAE)',
+    'pH_initial': 'Initial pH',
+    'OD_inoculum': 'Inoculum OD',
+    'Average_Temp': 'Mean Medium Temp (°C)'
+}
+df_importance['Feature_Name'] = df_importance['Feature'].map(label_mapping).fillna(df_importance['Feature'])
+
+# =====================================================================
+# 3. HIGH-END VISUALIZATION
+# =====================================================================
+color_dict = {
+    'Control Tea': 'orange',
+    'Low Sugar Tea': '#cc5500',
+    'Pineapple Juice': 'gold',
+    'Blackberry Wastes': 'magenta'
+}
+
+sns.set_theme(style="whitegrid")
+fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+# --- PLOT SINISTRO: Actual vs Predicted ---
+ax0 = axes[0]
+min_val = min(y.min(), y_pred.min()) - 0.2
+max_val = max(y.max(), y_pred.max()) + 0.2
+
+ax0.plot([min_val, max_val], [min_val, max_val], ':', color='dimgray', linewidth=1.5, label='Ideal Perfect Fit (1:1)', zorder=1)
+
+# TRUCCO FASCIA AZZURRA PERFETTA
+plot_df = pd.DataFrame({'Actual': y, 'Predicted': y_pred}).sort_values('Actual')
+sns.regplot(
+    data=plot_df, x='Actual', y='Predicted', scatter=False, color='navy', ci=95,
+    line_kws={'linestyle': '--', 'linewidth': 2.5, 'label': 'Actual Model Trend (95% CI)'}, ax=ax0
+)
+
+for i in range(len(df_ml)):
+    b_id = df_ml['Batch_id'].iloc[i]
+    color = color_dict.get(df_ml['Substrate_Group'].iloc[i], 'blue')
+    batch_label = b_id.replace('_', ' ')
+
+    ax0.scatter(y.iloc[i], y_pred[i], color=color, s=170, edgecolor='black', linewidth=1.5, zorder=3)
+    text_color = 'red' if 'Batch 3' in batch_label else 'black'
+    ax0.annotate(batch_label, (y.iloc[i], y_pred[i]), xytext=(10, 5), textcoords='offset points',
+                 fontsize=10, fontweight='bold', color=text_color, zorder=4)
+
+# Titoli aggiornati
+ax0.set_title('Ridge Regression: Core Features & Temp (Actual vs Predicted)', fontsize=14, fontweight='bold', pad=15)
+ax0.set_xlabel('Actual BC Yield [g/L]', fontsize=12, fontweight='bold')
+ax0.set_ylabel('Predicted BC Yield [g/L]', fontsize=12, fontweight='bold')
+ax0.set_xlim(min_val, max_val)
+ax0.set_ylim(min_val, max_val)
+ax0.legend(loc='upper left', frameon=True, edgecolor='black', fontsize=10)
+
+textstr = f'$R^2$ = {r2:.3f}\nMAE = {mae:.3f} g/L'
+props = dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='black')
+ax0.text(0.05, 0.85, textstr, transform=ax0.transAxes, fontsize=11, fontweight='bold', verticalalignment='top', bbox=props)
+
+# --- PLOT DESTRO: Feature Importance ---
+ax1 = axes[1]
+sns.barplot(
+    x='Importance', y='Feature_Name', data=df_importance,
+    palette='viridis', ax=ax1, edgecolor='none'
+)
+
+ax1.set_title('Feature Importance (Core & Temperature)', fontsize=14, fontweight='bold', pad=15)
+ax1.set_xlabel('Relative Weight on the Model (%)', fontsize=12, fontweight='bold')
+ax1.set_ylabel('')
+ax1.set_yticklabels(ax1.get_yticklabels(), fontsize=11, fontweight='bold')
+
+for p in ax1.patches:
+    width = p.get_width()
+    ax1.text(width + 0.5, p.get_y() + p.get_height()/2., f'{width:.1f}%', va='center', ha='left', fontsize=10, fontweight='bold')
+
+ax1.set_xlim(0, df_importance['Importance'].max() + 10)
+
+plt.tight_layout()
+output_filename = 'ml_core_features_with_temp_yield.png'
+plt.savefig(output_filename, dpi=300, bbox_inches='tight')
+print(f"Grafico completo salvato come: '{output_filename}'\n")
+
+# =====================================================================
+# 4. EQUAZIONE IN SCALA REALE E RESIDUI
+# =====================================================================
+scaler = ml_pipeline.named_steps['scaler']
+ridge = ml_pipeline.named_steps['ridge']
+
+orig_coefs = ridge.coef_ / scaler.scale_
+orig_intercept = ridge.intercept_ - np.sum(ridge.coef_ * scaler.mean_ / scaler.scale_)
+
+print("="*85)
+print(">>> 🔬 EQUAZIONE PREDITTIVA FINALE (CORE + TEMP) <<<")
+print("="*85)
+print(f"BC_Yield_g_L = {orig_intercept:+.5f}")
+for col, coef in zip(X.columns, orig_coefs):
+    clean_name = label_mapping.get(col, col)
+    print(f"               {coef:+.5f} * [{clean_name}]")
+print("="*85)
+
+df_ml['Predicted_Yield'] = y_pred
+df_ml['Residual'] = df_ml['BC_yield_g_L'] - df_ml['Predicted_Yield']
+
+print("\n" + "="*85)
+print(">>> 📊 TABELLA DEI RESIDUI (TUTTI I BATCH) <<<")
+print("="*85)
+print(f"{'Batch ID':<10} | {'Substrate':<18} | {'Actual (g/L)':<12} | {'Pred (g/L)':<12} | {'Residual':<10}")
+print("-" * 85)
+for _, row in df_ml.iterrows():
+    print(f"{row['Batch_id']:<10} | {row['Substrate_Group']:<18} | {row['BC_yield_g_L']:<12.3f} | {row['Predicted_Yield']:<12.3f} | {row['Residual']:<+10.3f}")
+print("-" * 85)
+print(f"Mean Absolute Error (MAE): {np.abs(df_ml['Residual']).mean():.3f} g/L")
+print("="*85 + "\n")
