@@ -1,0 +1,104 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score, mean_absolute_error 
+
+# =============================================================================
+# 1. Data Ingestion and Structuring
+# =============================================================================
+# Load the standardized dataset specifically formatted for Machine Learning.
+# The data is expected to be structurally clean to ensure zero-friction ingestion.
+file_path = 'ML_Ready_BC_Dataset.xlsx'
+df = pd.read_excel(file_path)
+
+# =============================================================================
+# 2. Feature and Target Variable Definition
+# =============================================================================
+# Define the independent variables (features) and the dependent variable (target).
+# FRAP and TFC have been intentionally excluded from this specific analysis iteration.
+feature_cols = [
+    'Average_Temp', 'TPC', 'Sugars_Brix', 
+    'Proteins', 'pH', 'Inoculum_OD'
+]
+X = df[feature_cols]
+y = df['BC_productivity']
+
+# =============================================================================
+# 3. Model Initialization, Training and Evaluation
+# =============================================================================
+# Initialize the Random Forest Regressor.
+# 'n_estimators=100' specifies the deployment of 100 independent decision trees 
+# to mitigate overfitting and ensure statistical stability.
+# 'random_state=42' guarantees complete mathematical reproducibility of the results.
+rf_model = RandomForestRegressor(n_estimators=100, random_state=42)
+
+# Train the model to map the complex, non-linear relationships between inputs and yield.
+rf_model.fit(X, y)
+
+# Predict values to evaluate model accuracy
+y_pred = rf_model.predict(X)
+
+# Calculate key academic performance metrics
+# R2 indicates explained variance; MAE is used for highly interpretable linear error.
+r2 = r2_score(y, y_pred)
+mae = mean_absolute_error(y, y_pred)
+
+# =============================================================================
+# 4. Feature Importance Extraction & Conversion
+# =============================================================================
+# Extract the relative importance scores and convert them directly to percentages.
+importances_pct = rf_model.feature_importances_ * 100
+
+# Structure the analytical results into a Pandas DataFrame and sort descending.
+df_importance = pd.DataFrame({
+    'Process_Variable': feature_cols, 
+    'Relative_Importance': importances_pct
+}).sort_values(by='Relative_Importance', ascending=False)
+
+# =============================================================================
+# 5. Visualization and Export
+# =============================================================================
+# Set an esthetic suitable for scientific publications.
+sns.set_theme(style="whitegrid", rc={"axes.edgecolor": "black", "grid.color": "#e0e0e0"})
+
+# Initialize the figure with an optimal aspect ratio.
+plt.figure(figsize=(10, 6))
+
+# Generate the horizontal bar plot using a professional color gradient ('viridis').
+barplot = sns.barplot(
+    x='Relative_Importance', 
+    y='Process_Variable', 
+    data=df_importance, 
+    palette='viridis' 
+)
+
+# Format titles and labels with appropriate padding and bold fonts.
+plt.title('Relative Importance of Initial Parameters on BC productivity', fontsize=14, fontweight='bold', pad=15)
+plt.xlabel('Relative Feature Importance (%)', fontsize=12, fontweight='bold')
+plt.ylabel('Process Variables', fontsize=12, fontweight='bold')
+
+# Extend the x-axis slightly to accommodate the numerical percentage labels.
+plt.xlim(0, max(df_importance['Relative_Importance']) * 1.15)
+
+# Annotate each bar with its exact percentage score (rounded to 1 decimal place).
+for p in barplot.patches:
+    width = p.get_width()
+    plt.text(width + 0.5, p.get_y() + p.get_height() / 2. + 0.05,
+             f'{width:.1f}%', ha="left", va="center", fontsize=10, color='black')
+
+# Embed a professional text box with R2 and MAE metrics in the bottom right corner.
+metrics_text = f"$R^2 = {r2:.3f}$\n$MAE = {mae:.3f}$ g/L"
+plt.gca().text(0.95, 0.05, metrics_text,
+               transform=plt.gca().transAxes,
+               fontsize=12, 
+               verticalalignment='bottom', 
+               horizontalalignment='right',
+               bbox=dict(boxstyle='round,pad=0.5', facecolor='white', edgecolor='black', alpha=0.9))
+
+# Adjust layout constraints and export as a high-resolution PNG image for the thesis.
+plt.tight_layout()
+plt.savefig('Thesis_Feature_Importance_Metrics.png', dpi=300)
+
+# Display the plot in the execution environment.
+plt.show()
