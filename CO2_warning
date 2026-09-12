@@ -1,0 +1,175 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error
+
+# =====================================================================
+# 1. LETTURA NATURALE & ZERO FRICTION DEL FILE EXCEL
+# =====================================================================
+file_path = 'data_10_master_final.xlsx'
+
+try:
+    xls = pd.ExcelFile(file_path, engine='openpyxl')
+    df_ts = pd.read_excel(xls, sheet_name='time_series')
+    df_meta = pd.read_excel(xls, sheet_name='metadata')
+except Exception as e:
+    raise RuntimeError(f"Errore nella lettura del file Excel: {e}")
+
+df_ts.columns = df_ts.columns.str.strip()
+df_meta.columns = df_meta.columns.str.strip()
+
+excluded_batches = ['Batch_5', 'Batch_7']
+df_meta = df_meta[~df_meta['Batch_id'].isin(excluded_batches)].copy()
+df_ts = df_ts[~df_ts['Batch_id'].isin(excluded_batches)].copy()
+
+# =====================================================================
+# 2. ESTRAZIONE E INTERPOLAZIONE CO2 AL 12° ORA VS RESA FINALE
+# =====================================================================
+model_data = []
+
+for batch in df_meta['Batch_id'].unique():
+    df_b = df_ts[df_ts['Batch_id'] == batch].sort_values('Time_h').reset_index(drop=True)
+    if df_b.empty: continue
+
+    m_row = df_meta[df_meta['Batch_id'] == batch]
+    if m_row.empty: continue
+
+    yield_val = m_row['BC_yield_g_L'].values[0]
+    substrate = m_row['Substrate'].values[0].strip()
+
+    if 'CO2_ppm_online' in df_b.columns:
+        valid_data = df_b.dropna(subset=['CO2_ppm_online', 'Time_h'])
+        if not valid_data.empty and valid_data['Time_h'].min() <= 12.0 <= valid_data['Time_h'].max():
+            co2_12h = np.interp(12.0, valid_data['Time_h'], valid_data['CO2_ppm_online'])
+        elif not valid_data.empty:
+            idx_closest = (valid_data['Time_h'] - 12.0).abs().idxmin()
+            co2_12h = valid_data.loc[idx_closest, 'CO2_ppm_online']
+        else:
+            continue
+    else:
+        continue
+
+    status = 'High Yield (≥ 1.5 g/L)' if yield_val >= 1.5 else 'Low Yield (< 1.5 g/L)'
+    model_data.append({
+        'Batch_id': batch, 'Substrate': substrate,
+        'CO2_12h': co2_12h, 'BC_Yield_g_L': yield_val, 'Performance_Status': status
+    })
+
+df_model = pd.DataFrame(model_data)
+
+# =====================================================================
+# 3. REGRESSIONE LINEARE, MAE E CALCOLO RESIDUALS
+# =====================================================================
+X = df_model[['CO2_12h']]
+y = df_model['BC_Yield_g_L']
+
+reg = LinearRegression()
+reg.fit(X, y)
+y_pred = reg.predict(X)
+
+r2 = reg.score(X, y)
+slope = reg.coef_[0]
+intercept = reg.intercept_
+mae = mean_absolute_error(y, y_pred)
+
+target_yield = 1.5
+co2_target = (target_yield - intercept) / slope if slope != 0 else 0
+
+# =====================================================================
+# 4. VISUALIZZAZIONE SCIENTIFICA ANTICOLLISIONE (DUAL-OFFSET SYSTEM)
+# =====================================================================
+fig, ax = plt.subplots(figsize=(11, 7))
+sns.set_theme(style="whitegrid")
+
+x_min, x_max = df_model['CO2_12h'].min() - 800.0, df_model['CO2_12h'].max() + 1000.0
+y_min, y_max = -0.2, max(df_model['BC_Yield_g_L'].max() + 0.4, 2.3)
+
+# Quadranti
+ax.axvspan(co2_target, x_max + 2000, ymin=(target_yield - y_min)/(y_max - y_min), ymax=1.0, color='#98FB98', alpha=0.4, zorder=1)
+ax.axvspan(x_min - 1000, co2_target, ymin=0.0, ymax=(target_yield - y_min)/(y_max - y_min), color='#FF6961', alpha=0.4, zorder=1)
+
+# ---- DIZIONARI PER GESTIRE LE POSIZIONI ED EVITARE SOVRAPPOSIZIONI ----
+# Posizione dei nomi dei Batch (X, Y) in punti offset rispetto al pallino
+label_offsets = {
+    'Batch_1': (-65, 12),  # Nome spostato a sinistra-alto
+    'Batch_2': (15, -15),  # Nome in basso a destra
+    'Batch_3': (15, -15),  # Nome in basso a destra
+    'Batch_4': (-65, -15), # Nome spostato in basso a sinistra (così non urta il residuo che sale)
+    'Batch_6': (15, 10)    # Nome in alto a destra
+}
+
+# Spostamento orizzontale per il cartellino del residuo (unità ppm sull'asse X)
+residual_x_offsets = {
+    'Batch_1': 120,   # Residuo a destra
+    'Batch_2': -120,  # Residuo a sinistra (fa spazio al limite del grafico)
+    'Batch_3': 120,   # Residuo a destra
+    'Batch_4': 120,   # Residuo a destra
+    'Batch_6': 120    # Residuo a destra
+}
+
+bbox_props = dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor="none", alpha=0.85)
+
+# Disegno Residui
+for i, row in df_model.iterrows():
+    b_id = row['Batch_id']
+    x_val = row['CO2_12h']
+    y_real = row['BC_Yield_g_L']
+    y_pred_val = slope * x_val + intercept
+    residual = y_real - y_pred_val
+
+    # Linea verticale
+    ax.plot([x_val, x_val], [y_real, y_pred_val], color='dimgray', linestyle=':', linewidth=1.5, zorder=2)
+
+    # Testo del residuo spostato in modo intelligente
+    mid_y = (y_real + y_pred_val) / 2
+    x_shift = residual_x_offsets.get(b_id, 120)
+    ha_align = 'left' if x_shift > 0 else 'right'
+
+    ax.text(x_val + x_shift, mid_y, f"{residual:+.2f}", color='dimgray', fontsize=10,
+            fontweight='bold', verticalalignment='center', horizontalalignment=ha_align,
+            bbox=bbox_props, zorder=4)
+
+# Scatter plot
+status_colors = {'High Yield (≥ 1.5 g/L)': '#2ca02c', 'Low Yield (< 1.5 g/L)': '#d62728'}
+sns.scatterplot(data=df_model, x='CO2_12h', y='BC_Yield_g_L', hue='Performance_Status',
+                palette=status_colors, s=260, edgecolor='black', linewidth=1.5, ax=ax, zorder=3)
+
+# Linee di Target e Modello
+x_line = np.linspace(x_min, x_max, 100)
+y_line = slope * x_line + intercept
+ax.plot(x_line, y_line, color='crimson', linestyle='--', linewidth=2.5, label='Predictive Model', zorder=2)
+ax.axhline(y=target_yield, color='dimgray', linestyle=':', linewidth=2.0, label=f'Target Yield Line ({target_yield} g/L)', zorder=2)
+ax.axvline(x=co2_target, color='orange', linestyle='-.', linewidth=1.8, label=f'Required CO₂ at 12h ({co2_target:.0f} ppm)', zorder=2)
+
+# Applicazione offset per i Nomi Batch
+for _, row in df_model.iterrows():
+    b_id = row['Batch_id']
+    offset = label_offsets.get(b_id, (15, 5))
+    ax.annotate(b_id, (row['CO2_12h'], row['BC_Yield_g_L']), xytext=offset,
+                textcoords='offset points', fontsize=11, fontweight='bold', color='black', zorder=5)
+
+# Riquadro
+stats_text = (f"Equation: y = {slope:.5f}x + {intercept:.3f}\n"
+              f"R² = {r2:.2f}\n"
+              f"MAE = {mae:.2f} g/L")
+props = dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.9, edgecolor='black')
+ax.text(0.02, 0.95, stats_text, transform=ax.transAxes, fontsize=12, fontweight='bold',
+        verticalalignment='top', bbox=props, zorder=6)
+
+ax.set_xlabel('Headspace CO₂ at 12h [ppm]', fontsize=13, fontweight='bold', labelpad=10)
+ax.set_ylabel('Cellulose Final Yield [g/L]', fontsize=13, fontweight='bold', labelpad=10)
+ax.set_title('Predictive warning: 12h CO₂ Respiration vs Final BC Yield', fontsize=15, fontweight='bold', pad=20)
+
+ax.set_xlim(x_min, x_max)
+ax.set_ylim(y_min, y_max)
+ax.legend(loc='lower right', frameon=True, edgecolor='black', fontsize=11)
+
+for spine in ax.spines.values():
+    spine.set_edgecolor('black')
+    spine.set_linewidth(1.2)
+
+plt.tight_layout()
+plt.savefig('predictive_model_clean_labels.png', dpi=300, bbox_inches='tight')
+plt.show()
