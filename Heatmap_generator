@@ -1,0 +1,171 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# =====================================================================
+# 1. CARICAMENTO DATI (Zero-Friction dal file Aggiornato)
+# =====================================================================
+file_path = 'data_10_master_final.xlsx' 
+
+try:
+    xls = pd.ExcelFile(file_path, engine='openpyxl')
+    df = pd.read_excel(xls, sheet_name='time_series')
+    df.columns = df.columns.str.strip()
+    print("✅ Dati caricati con successo dal foglio 'time_series'.")
+except Exception as e:
+    raise RuntimeError(f"Errore lettura file: {e}")
+
+# =====================================================================
+# 2. SELEZIONE E INTERPOLAZIONE SENSORI (Ora con il DO!)
+# =====================================================================
+ph_col = 'pH_online' if ('pH_online' in df.columns and df['pH_online'].notna().sum() > 0) else 'pH_offline'
+
+# 🚨 AGGIUNTO IL DISSOLVED OXYGEN (DO) 🚨
+col_mapping = {
+    ph_col: 'pH',
+    'TDS_ppm_online': 'TDS (ppm)',
+    'CO2_ppm_online': 'CO2 (ppm)',
+    'O2_volperc_online': 'O2 (%)',
+    'Dissolved_oxygen_ppm_online': 'DO (ppm)',  # <-- Eccolo qui!
+    'Temperature_medium_C_offline': 'Temp (°C)',
+    'brix_offline': 'Sugars (Brix)',
+    'Proteins_mg_ml_offline': 'Proteins',
+    'TPC_mg_ml_offline': 'TPC',
+    'TFC_mg_ml_offline': 'TFC',
+    'FRAP_mg_ml_offline': 'FRAP',
+    'Cellulose_disks_thickness_mm_offline': 'BC Thickness (mm)',
+    'Level_cm': 'Liquid Level (cm)'
+}
+
+available_cols = [c for c in col_mapping.keys() if c in df.columns]
+df_ml = df[['Batch_id', 'Time_h'] + available_cols].copy()
+
+# Conversione a numerico
+for col in available_cols:
+    df_ml[col] = pd.to_numeric(df_ml[col], errors='coerce')
+
+# Interpolazione lineare intra-batch
+df_ml[available_cols] = df_ml.groupby('Batch_id')[available_cols].transform(
+    lambda x: x.interpolate(method='linear', limit_direction='both')
+)
+
+# =====================================================================
+# 3. MOTORE GEOMETRICO: CALCOLO ACQUA EVAPORATA E VOLUMI BC
+# =====================================================================
+print("⚙️ Motore fluidodinamico in esecuzione...")
+
+tank_L, tank_W, axis_Z = 24.25, 16.0, 8.8
+disc_radius, disc_width = 7.4, 0.3
+r_array = np.linspace(0, disc_radius, 200)
+
+def calculate_volumes(group):
+    if 'Level_cm' not in group.columns or 'Cellulose_disks_thickness_mm_offline' not in group.columns:
+        group['Evaporated_Water_mL'] = np.nan
+        group['Total_BC_Volume_mL'] = np.nan
+        return group
+        
+    times = group['Time_h'].values
+    levels = group['Level_cm'].values
+    thk_mm = group['Cellulose_disks_thickness_mm_offline'].values
+    
+    if len(levels) == 0 or pd.isna(levels[0]) or pd.isna(thk_mm[0]):
+         group['Evaporated_Water_mL'] = np.nan
+         group['Total_BC_Volume_mL'] = np.nan
+         return group
+
+    Thk_matrix = np.zeros((len(times), len(r_array)))
+    for i in range(1, len(times)):
+        dThk = max(0, (thk_mm[i] - thk_mm[i-1]) / 10.0) 
+        r_wet_threshold = axis_Z - levels[i]
+        is_wet = r_array >= r_wet_threshold
+        Thk_matrix[i] = Thk_matrix[i-1] + (dThk * is_wet)
+        
+    def get_vols(lvl, T_r):
+        V_bc_facce = 2 * np.trapz(2 * np.pi * r_array * T_r, r_array)
+        T_rim = T_r[-1]
+        V_bc_bordo = np.pi * ((disc_radius + T_rim)**2 - disc_radius**2) * disc_width
+        V_bc_totale = (V_bc_facce + V_bc_bordo) * 8
+        
+        V_lordo = tank_W * tank_L * lvl
+        h_rel = lvl - axis_Z
+        r_safe = np.maximum(r_array, 1e-6)
+        fraction_submerged = np.arccos(np.clip(-h_rel / r_safe, -1.0, 1.0)) / np.pi 
+        
+        W_r_tot = disc_width + 2 * T_r
+        V_solido_facce_sommerse = np.trapz(2 * np.pi * r_array * W_r_tot * fraction_submerged, r_array)
+        
+        V_solido_bordo_tot = np.pi * ((disc_radius + T_rim)**2 - disc_radius**2) * disc_width
+        fraction_rim = np.arccos(np.clip(-h_rel / disc_radius, -1.0, 1.0)) / np.pi
+        V_solido_bordo_sommerso = V_solido_bordo_tot * fraction_rim
+        
+        V_solido_sommerso_totale = (V_solido_facce_sommerse + V_solido_bordo_sommerso) * 8
+        V_liquido_netto = V_lordo - V_solido_sommerso_totale
+        
+        return V_liquido_netto, V_bc_totale
+        
+    V_L0, _ = get_vols(levels[0], Thk_matrix[0])
+    
+    evap_list, bc_vol_list = [], []
+    for i in range(len(times)):
+        V_L_curr, V_BC_curr = get_vols(levels[i], Thk_matrix[i])
+        V_evap = max(0, V_L0 - V_L_curr - V_BC_curr)
+        evap_list.append(V_evap)
+        bc_vol_list.append(V_BC_curr)
+        
+    group['Evaporated_Water_mL'] = evap_list
+    group['Total_BC_Volume_mL'] = bc_vol_list
+    return group
+    
+df_ml = df_ml.groupby('Batch_id').apply(calculate_volumes).reset_index(drop=True)
+
+col_mapping['Evaporated_Water_mL'] = 'Evap. Water (mL)'
+col_mapping['Total_BC_Volume_mL'] = 'BC Volume (mL)'
+available_cols.extend(['Evaporated_Water_mL', 'Total_BC_Volume_mL'])
+
+df_ml.rename(columns=col_mapping, inplace=True)
+final_cols = [col_mapping[c] for c in available_cols if col_mapping[c] in df_ml.columns]
+
+df_corr = df_ml[final_cols].corr(method='pearson').round(3)
+
+# =====================================================================
+# 4. ESPORTAZIONE EXCEL E HEATMAP
+# =====================================================================
+output_dir = "RDB_Metabolic_Analysis"
+os.makedirs(output_dir, exist_ok=True)
+
+# Esportazione in un VERO foglio Excel
+output_excel = os.path.join(output_dir, 'Matrice_Completa_Tesi_2.xlsx')
+with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+    df_corr.to_excel(writer, sheet_name='Correlation_Matrix')
+print(f"📊 Dati esportati su Excel puro: '{output_excel}'")
+
+# Heatmap
+fig, ax = plt.subplots(figsize=(15, 12))  # Leggermente allargato per far spazio alla nuova colonna
+fig.patch.set_facecolor('white')
+ax.set_facecolor('white')
+
+mask = np.triu(np.ones_like(df_corr, dtype=bool))
+cmap = plt.cm.RdYlGn
+
+sns.heatmap(df_corr, mask=mask, annot=True, fmt=".2f", cmap=cmap, 
+            vmin=-1, vmax=1, center=0, square=True, linewidths=1.0, 
+            cbar_kws={"shrink": .8, "label": "Pearson Correlation Coefficient"},
+            annot_kws={"size": 10, "weight": "bold"}, ax=ax)
+
+ax.set_title("Comprehensive Metabolic, Telemetry & Volume Correlation Matrix", 
+             fontsize=16, fontweight='bold', pad=20, color='#2C3E50')
+
+plt.xticks(rotation=45, ha='right', fontsize=11, fontweight='bold', color='#34495E')
+plt.yticks(rotation=0, fontsize=11, fontweight='bold', color='#34495E')
+plt.tight_layout()
+
+output_img = os.path.join(output_dir, "Thesis_Full_Metabolic_Volume_Heatmap_con_DO.png")
+plt.savefig(output_img, dpi=300, bbox_inches='tight')
+plt.close()
+print(f"🖼️ Immagine HD salvata: '{output_img}'")
+print("\n🔥 Lavoro concluso! Matrice e Grafico pronti per il copia-incolla.")
