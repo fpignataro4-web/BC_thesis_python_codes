@@ -1,0 +1,287 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from matplotlib.animation import FuncAnimation, PillowWriter
+import os
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# =============================================================================
+# 1. THEMATIC CONFIGURATION & BATCH SETUP
+# =============================================================================
+# Load the raw telemetry data.
+file_path = 'data_10_master_final.xlsx'
+
+# Define academic color palettes mapping to respective substrates.
+THEMES = {
+    'tea': {
+        'liquid': '#D35400',   # Amber / Dark Orange
+        'bc_fill': '#F39C12',  # Light Orange Hydrogel
+        'bc_edge': '#B9770E',  # Dark Border
+        'disc': '#6E2C00'      # Dark brown concentrated tea
+    },
+    'pineapple': {
+        'liquid': '#F4D03F',   # Pineapple Yellow
+        'bc_fill': '#F9E79F',  # Pale Yellow
+        'bc_edge': '#D4AC0D',  # Gold Border
+        'disc': '#7D6608'      # Dark Mustard
+    },
+    'blackberry': {
+        'liquid': '#8E44AD',   # Magenta / Bright Purple
+        'bc_fill': '#D2B4DE',  # Lilac
+        'bc_edge': '#7D3C98',  # Plum Border
+        'disc': '#4A235A'      # Very Dark Purple
+    },
+    'default': {
+        'liquid': '#3498DB', 'bc_fill': '#F1C40F', 'bc_edge': '#D4AC0D', 'disc': '#2C3E50'
+    }
+}
+
+# Map batches to their specific themes.
+BATCH_CONFIG = {
+    'Batch_1': 'tea',
+    'Batch_2': 'tea',
+    'Batch_3': 'blackberry',
+    'Batch_4': 'tea',
+    'Batch_5': 'tea',
+    'Batch_6': 'pineapple',
+    'Batch_7': 'pineapple'
+}
+
+# Define specific academic labels for the telemetry legend
+BATCH_LABELS = {
+    'Batch_1': 'Control tea',
+    'Batch_2': 'Control tea',
+    'Batch_3': 'Blackberry wastes',
+    'Batch_4': 'Low sugar tea',
+    'Batch_5': 'Low sugar tea',
+    'Batch_6': 'Pineapple juice', 
+    'Batch_7': 'Pineapple juice'
+}
+
+output_dir = 'RDB_Presentation_GIFs'
+os.makedirs(output_dir, exist_ok=True)
+
+# =============================================================================
+# 2. GEOMETRIC ENGINE & VOLUMETRIC KINEMATICS
+# =============================================================================
+# Reactor spatial constraints (cm)
+tank_L, tank_W, tank_H = 24.25, 16.0, 18.0      
+axis_Z = 8.8
+disc_radius, disc_width, disc_gap = 7.4, 0.3, 1.5
+right_margin = tank_L - 1.5 
+disc_centers_x = [right_margin - (disc_width / 2) - i*(disc_width + disc_gap) for i in range(8)]
+r_array = np.linspace(0, disc_radius, 200)
+
+y_array = np.linspace(axis_Z - disc_radius, axis_Z + disc_radius, 300)
+r_y = np.abs(y_array - axis_Z) 
+
+def get_volumes(lvl, T_r):
+    """
+    Integrates system volumes and rigorously calculates the submerged 
+    disc fraction based on Effective Radius (Plastic + BC rim thickness).
+    """
+    # BC Total Volume Calculation
+    V_bc_facce = 2 * np.trapz(2 * np.pi * r_array * T_r, r_array)
+    T_rim = T_r[-1] # Thickness at the rim
+    V_bc_bordo = np.pi * ((disc_radius + T_rim)**2 - disc_radius**2) * disc_width
+    V_bc_totale = (V_bc_facce + V_bc_bordo) * 8
+    
+    # Net Liquid Volume Calculation (Considers submerged solids)
+    V_lordo = tank_W * tank_L * lvl
+    h_rel = lvl - axis_Z
+    r_safe = np.maximum(r_array, 1e-6)
+    fraction_submerged_radial = np.arccos(np.clip(-h_rel / r_safe, -1.0, 1.0)) / np.pi 
+    
+    W_r_tot = disc_width + 2 * T_r
+    V_solido_facce_sommerse = np.trapz(2 * np.pi * r_array * W_r_tot * fraction_submerged_radial, r_array)
+    
+    V_solido_bordo_tot = np.pi * ((disc_radius + T_rim)**2 - disc_radius**2) * disc_width
+    fraction_rim = np.arccos(np.clip(-h_rel / disc_radius, -1.0, 1.0)) / np.pi
+    V_solido_bordo_sommerso = V_solido_bordo_tot * fraction_rim
+    
+    V_solido_sommerso_totale = (V_solido_facce_sommerse + V_solido_bordo_sommerso) * 8
+    V_liquido_netto = V_lordo - V_solido_sommerso_totale
+    
+    # *** RIGOROUS SUBMERGED FRACTION CALCULATION ***
+    # We implement the Effective Radius (Plastic Disc + BC Rim Thickness)
+    # R_eff = 7.4 + T_rim(t)
+    effective_radius = disc_radius + T_rim
+    
+    # Area of circular segment = R^2 * arccos(-d/R) + d * sqrt(R^2 - d^2)
+    # where R = effective_radius and d = clip(lvl - axis_Z). 
+    d_clipped = np.clip(lvl - axis_Z, -effective_radius, effective_radius)
+    alpha = np.arccos(np.clip(-d_clipped / effective_radius, -1.0, 1.0))
+    area_per_face = (effective_radius**2 * alpha) + (d_clipped * np.sqrt(np.maximum(0, effective_radius**2 - d_clipped**2)))
+    
+    # Calculate fraction relative to TOTAL EFFECTIVE area 
+    total_effective_area = np.pi * effective_radius**2
+    subm_fraction = area_per_face / total_effective_area
+    
+    return V_liquido_netto, V_bc_totale, subm_fraction
+
+def get_bc_polygon(X_c, T_y):
+    """Generates dynamic BC geometries taking into account radial thickness."""
+    if np.max(T_y) < 0.01: return np.zeros((3,2))
+    x_right = X_c + (disc_width / 2) + T_y
+    x_left = X_c - (disc_width / 2) - T_y
+    
+    top_cap_r = (disc_width / 2) + T_y[-1]
+    theta_top = np.linspace(0, np.pi, 30)
+    x_top_cap, y_top_cap = X_c + top_cap_r * np.cos(theta_top), y_array[-1] + top_cap_r * np.sin(theta_top)
+    
+    bottom_cap_r = (disc_width / 2) + T_y[0]
+    theta_bot = np.linspace(np.pi, 2*np.pi, 30)
+    x_bot_cap, y_bot_cap = X_c + bottom_cap_r * np.cos(theta_bot), y_array[0] + bottom_cap_r * np.sin(theta_bot)
+    
+    x_poly = np.concatenate([x_right, x_top_cap, x_left[::-1], x_bot_cap])
+    y_poly = np.concatenate([y_array, y_top_cap, y_array[::-1], y_bot_cap])
+    return np.column_stack((x_poly, y_poly))
+
+# =============================================================================
+# 3. DATA INGESTION
+# =============================================================================
+try:
+    xls = pd.ExcelFile(file_path, engine='openpyxl')
+    df_full = pd.read_excel(xls, sheet_name='time_series')
+    df_full.columns = df_full.columns.str.strip()
+except Exception as e:
+    raise RuntimeError(f"Data loading failed: {e}")
+
+# =============================================================================
+# 4. ANIMATION PIPELINE GENERATOR
+# =============================================================================
+fps = 20
+hours_per_second = 5.0
+frames_per_hour = fps / hours_per_second
+
+for batch_id, theme_name in BATCH_CONFIG.items():
+    print(f"\n=======================================================")
+    print(f"🎬 Compiling rigorous model animation for {batch_id} (Theme: {theme_name.upper()})...")
+    
+    theme = THEMES.get(theme_name, THEMES['default'])
+    batch_label = BATCH_LABELS.get(batch_id, theme_name.capitalize())
+    
+    df_b = df_full[df_full['Batch_id'] == batch_id].sort_values('Time_h').reset_index(drop=True)
+    
+    if df_b.empty: continue
+        
+    df_b['Time_h'] = pd.to_numeric(df_b['Time_h'], errors='coerce')
+    df_b['Level_cm'] = pd.to_numeric(df_b['Level_cm'], errors='coerce')
+    df_b['Cellulose_disks_thickness_mm_offline'] = pd.to_numeric(df_b['Cellulose_disks_thickness_mm_offline'], errors='coerce')
+    
+    df_level = df_b.dropna(subset=['Time_h', 'Level_cm'])
+    df_thick = df_b.dropna(subset=['Time_h', 'Cellulose_disks_thickness_mm_offline'])
+    
+    if df_thick.empty: continue
+        
+    max_time = df_thick['Time_h'].max()
+    num_frames = int(max_time * frames_per_hour)
+    time_interp = np.linspace(0, max_time, num_frames)
+    
+    level_interp = np.interp(time_interp, df_level['Time_h'], df_level['Level_cm'])
+    thick_interp = np.interp(time_interp, df_thick['Time_h'], df_thick['Cellulose_disks_thickness_mm_offline'])
+    
+    # Radial fluid dynamics (BC grows only on wetted surfaces)
+    Thk_matrix = np.zeros((num_frames, len(r_array)))
+    for i in range(1, num_frames):
+        dThk = max(0, (thick_interp[i] - thick_interp[i-1]) / 10.0) # mm to cm
+        r_wet_threshold = axis_Z - level_interp[i]
+        is_wet = r_array >= r_wet_threshold
+        Thk_matrix[i] = Thk_matrix[i-1] + (dThk * is_wet)
+        
+    V_L0, _, _ = get_volumes(level_interp[0], Thk_matrix[0])
+    
+    # ------------------ Plotting Infrastructure ------------------
+    fig, ax = plt.subplots(figsize=(12, 9))
+    fig.patch.set_facecolor('white')
+    ax.set_facecolor('white') 
+    ax.set_xlim(0, tank_L)
+    ax.set_ylim(0, tank_H)
+    ax.set_aspect('equal') 
+    ax.axis('off')
+
+    # Reactor Tank & Axis
+    ax.plot([0, tank_L], [0, 0], color='#2C3E50', linewidth=5, zorder=6)
+    ax.plot([0, 0], [0, tank_H], color='#2C3E50', linewidth=5, zorder=6)
+    ax.plot([tank_L, tank_L], [0, tank_H], color='#2C3E50', linewidth=5, zorder=6)
+    ax.plot([0, tank_L], [axis_Z, axis_Z], color='#7F8C8D', linewidth=3, linestyle='-.', zorder=1)
+
+    # *** DYNAMIC INITIAL LEVEL MARKER ***
+    initial_lvl_h = level_interp[0]
+    
+    ax.plot([0, tank_L], [initial_lvl_h, initial_lvl_h], color='#C0392B', linewidth=2, linestyle=':', zorder=7)
+    ax.text(0.5, initial_lvl_h + 0.2, f"Initial Level Baseline ({initial_lvl_h:.2f} cm)", color='#C0392B', fontsize=10, fontweight='bold', zorder=10)
+    
+    # Dynamic Liquid Surface
+    liquid_rect = patches.Rectangle((0, 0), tank_L, level_interp[0], linewidth=0, facecolor=theme['liquid'], alpha=0.35, zorder=2)
+    ax.add_patch(liquid_rect)
+    liquid_surface_line, = ax.plot([0, tank_L], [level_interp[0], level_interp[0]], color=theme['liquid'], linewidth=2, linestyle='--', zorder=3)
+
+    # Discs and BC Patches
+    bc_patches = []
+    
+    for cx in disc_centers_x:
+        # BC layer
+        bc_poly = patches.Polygon(np.zeros((3,2)), linewidth=1.5, edgecolor=theme['bc_edge'], facecolor=theme['bc_fill'], alpha=0.75, zorder=4)
+        bc_patches.append(bc_poly)
+        ax.add_patch(bc_poly)
+        
+        # Plastic Disc Core
+        disc_rect = patches.Rectangle((cx - disc_width/2, axis_Z - disc_radius), disc_width, disc_radius*2, linewidth=1, edgecolor='#17202A', facecolor=theme['disc'], alpha=0.9, zorder=5)
+        ax.add_patch(disc_rect)
+
+    # Live Telemetry Legend
+    props = dict(boxstyle='round,pad=0.7', facecolor='white', alpha=0.95, edgecolor='#BDC3C7')
+    metrics_text = ax.text(0.02, 0.96, "", transform=ax.transAxes, fontsize=12, fontweight='bold', color='#2C3E50', verticalalignment='top', bbox=props, zorder=10)
+
+    # ------------------ Frame Update Logic ------------------
+    def update(frame):
+        t = time_interp[frame]
+        lvl = level_interp[frame]
+        thk_mm = thick_interp[frame]
+        T_r = Thk_matrix[frame]
+        T_y = np.interp(r_y, r_array, T_r)
+        
+        # Update Liquid
+        liquid_rect.set_height(lvl)
+        liquid_surface_line.set_ydata([lvl, lvl])
+        
+        # Update Discs and BC
+        for i, cx in enumerate(disc_centers_x):
+            vertices = get_bc_polygon(cx, T_y)
+            if len(vertices) > 3:
+                bc_patches[i].set_xy(vertices)
+                bc_patches[i].set_visible(True)
+            else:
+                bc_patches[i].set_visible(False)
+                
+        # Fetch thermodynamic volumes & *** RIGOROUS SUBMERGED FRACTION ***
+        # Calculations now use the dynamic Effective Radius
+        V_L_curr, V_BC_curr, Subm_Frac = get_volumes(lvl, T_r)
+        V_evap = max(0, V_L0 - V_L_curr - V_BC_curr)
+        
+        testo = (f"{batch_id} - {batch_label}\n"
+                 f"Time: {t:05.1f} h\n"
+                 f"Level: {lvl:.2f} cm\n"
+                 f"Max BC Thickness: {thk_mm:.2f} mm\n"
+                 f"───────────────────\n"
+                 f"Free Liquid : {V_L_curr / 1000.0:.3f} L\n"
+                 f"Total BC Vol: {V_BC_curr:.0f} mL\n"
+                 f"Evap / Cons : {V_evap:.0f} mL\n"
+                 f"Subm. Frac  : {Subm_Frac * 100:.1f} %") # rigorous %
+                 
+        metrics_text.set_text(testo)
+        return [liquid_rect, liquid_surface_line, metrics_text] + bc_patches
+
+    # Render and Save Engine
+    ani = FuncAnimation(fig, update, frames=num_frames, interval=1000/fps, blit=True)
+    # Output filename updated to _model.gif
+    gif_path = os.path.join(output_dir, f"{batch_id}_{theme_name}_model.gif")
+    ani.save(gif_path, writer=PillowWriter(fps=fps))
+    plt.close(fig)
+    print(f"✅ Exported highly academic GIF: {gif_path}")
+
+print(f"\n🎉 SYSTEM PROCESS COMPLETE! Cinematic academic GIFs located in '{output_dir}'.")
