@@ -1,0 +1,175 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+import os
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# =============================================================================
+# 1. CONFIGURATION & BATCH SETUP
+# =============================================================================
+file_path = 'data_10_master_final.xlsx'
+output_dir = 'RDB_LineBalance_Plots'
+os.makedirs(output_dir, exist_ok=True)
+
+BATCH_CONFIG = {
+    'Batch_1': 'Control tea', 'Batch_2': 'Control tea', 'Batch_3': 'Blackberry wastes',
+    'Batch_4': 'Low sugar tea', 'Batch_5': 'Low sugar tea', 
+    'Batch_6': 'Pineapple juice', 'Batch_7': 'Pineapple juice'
+}
+
+# Specific colors requested
+COLOR_LIQUID = '#E74C3C'  # Red
+COLOR_BC = '#27AE60'      # Green
+COLOR_EVAP = '#3498DB'    # Blue
+
+# =============================================================================
+# 2. RIGOROUS GEOMETRIC ENGINE (Effective Radius Model)
+# =============================================================================
+tank_L, tank_W, axis_Z = 24.25, 16.0, 8.8      
+disc_radius, disc_width = 7.4, 0.3
+r_array = np.linspace(0, disc_radius, 200)
+
+def get_volumes(lvl, T_r):
+    V_bc_facce = 2 * np.trapz(2 * np.pi * r_array * T_r, r_array)
+    T_rim = T_r[-1] if len(T_r) > 0 else 0.0
+    V_bc_bordo = np.pi * ((disc_radius + T_rim)**2 - disc_radius**2) * disc_width
+    V_bc_totale = (V_bc_facce + V_bc_bordo) * 8
+    
+    V_lordo = tank_W * tank_L * lvl
+    h_rel = lvl - axis_Z
+    r_safe = np.maximum(r_array, 1e-6)
+    fraction_submerged_radial = np.arccos(np.clip(-h_rel / r_safe, -1.0, 1.0)) / np.pi 
+    
+    W_r_tot = disc_width + 2 * T_r
+    V_solido_facce_sommerse = np.trapz(2 * np.pi * r_array * W_r_tot * fraction_submerged_radial, r_array)
+    V_solido_bordo_tot = np.pi * ((disc_radius + T_rim)**2 - disc_radius**2) * disc_width
+    fraction_rim = np.arccos(np.clip(-h_rel / disc_radius, -1.0, 1.0)) / np.pi
+    V_solido_bordo_sommerso = V_solido_bordo_tot * fraction_rim
+    
+    V_solido_sommerso_totale = (V_solido_facce_sommerse + V_solido_bordo_sommerso) * 8
+    V_liquido_netto = V_lordo - V_solido_sommerso_totale
+    
+    return V_liquido_netto, V_bc_totale
+
+# =============================================================================
+# 3. DATA INGESTION
+# =============================================================================
+try:
+    df_full = pd.read_excel(file_path, sheet_name='time_series')
+    df_full.columns = df_full.columns.str.strip()
+except Exception as e:
+    raise RuntimeError(f"Data loading failed: {e}")
+
+# =============================================================================
+# 4. MASTER PLOTTING LOOP (External Legend Dashboard)
+# =============================================================================
+for batch_id, batch_label in BATCH_CONFIG.items():
+    print(f"📊 Generating Clean Dashboard Mass Balance for {batch_id}...")
+    
+    df_b = df_full[df_full['Batch_id'] == batch_id].sort_values('Time_h').reset_index(drop=True)
+    if df_b.empty: continue
+        
+    df_b['Time_h'] = pd.to_numeric(df_b['Time_h'], errors='coerce')
+    df_b['Level_cm'] = pd.to_numeric(df_b['Level_cm'], errors='coerce')
+    df_b['Cellulose_disks_thickness_mm_offline'] = pd.to_numeric(df_b['Cellulose_disks_thickness_mm_offline'], errors='coerce')
+    
+    df_clean = df_b.dropna(subset=['Time_h', 'Level_cm', 'Cellulose_disks_thickness_mm_offline'])
+    if df_clean.empty: continue
+        
+    max_time = df_clean['Time_h'].max()
+    num_points = 300 
+    time_interp = np.linspace(0, max_time, num_points)
+    level_interp = np.interp(time_interp, df_clean['Time_h'], df_clean['Level_cm'])
+    thick_interp = np.interp(time_interp, df_clean['Time_h'], df_clean['Cellulose_disks_thickness_mm_offline'])
+    
+    v_liquid_arr, v_bc_arr, v_evap_arr = [], [], []
+    Thk_matrix = np.zeros((num_points, len(r_array)))
+    
+    for i in range(num_points):
+        if i == 0:
+            dThk = 0
+        else:
+            dThk = max(0, (thick_interp[i] - thick_interp[i-1]) / 10.0) 
+            
+        r_wet_threshold = axis_Z - level_interp[i]
+        is_wet = r_array >= r_wet_threshold
+        Thk_matrix[i] = Thk_matrix[i-1] if i > 0 else np.zeros(len(r_array))
+        Thk_matrix[i] = Thk_matrix[i] + (dThk * is_wet)
+        
+        V_L, V_BC = get_volumes(level_interp[i], Thk_matrix[i])
+        
+        if i == 0: V_L0 = V_L
+            
+        V_E = max(0, V_L0 - V_L - V_BC)
+        
+        v_liquid_arr.append(V_L)
+        v_bc_arr.append(V_BC)
+        v_evap_arr.append(V_E)
+
+    # --- PLOT GENERATION ---
+    fig, ax1 = plt.subplots(figsize=(10, 6)) # Ridotta un po' la larghezza per far risaltare la legenda esterna
+    fig.patch.set_facecolor('white')
+    ax1.set_facecolor('#FDFEFE')
+    
+    # Plotting the lines
+    ax1.plot(time_interp, v_liquid_arr, color=COLOR_LIQUID, linewidth=3.5)
+    ax1.plot(time_interp, v_bc_arr, color=COLOR_BC, linewidth=3.5)
+    ax1.plot(time_interp, v_evap_arr, color=COLOR_EVAP, linewidth=3.5)
+    
+    # End points (Pallini)
+    end_time = time_interp[-1]
+    fin_liq, fin_bc, fin_evap = v_liquid_arr[-1], v_bc_arr[-1], v_evap_arr[-1]
+    
+    ax1.plot(0, V_L0, marker='o', markersize=8, color=COLOR_LIQUID) # Start Liquid
+    ax1.plot(end_time, fin_liq, marker='o', markersize=8, color=COLOR_LIQUID)
+    ax1.plot(end_time, fin_bc, marker='o', markersize=8, color=COLOR_BC)
+    ax1.plot(end_time, fin_evap, marker='o', markersize=8, color=COLOR_EVAP)
+    
+    # Axes Formatting
+    ax1.set_xlabel('Fermentation Time (h)', fontsize=13, fontweight='bold')
+    ax1.set_ylabel('Absolute Volume (mL)', fontsize=13, fontweight='bold', color='black')
+    ax1.set_xlim(0, max_time)
+    
+    max_y = V_L0 * 1.05
+    ax1.set_ylim(0, max_y)
+    ax1.grid(axis='both', linestyle='--', alpha=0.4)
+    
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('Initial Volume Fraction (%)', fontsize=13, fontweight='bold', color='black')
+    ax2.set_ylim(0, (max_y / V_L0) * 100)
+    
+    # --- EXTERNAL DASHBOARD LEGEND ---
+    # Creiamo gli elementi personalizzati per la legenda (titolo in bold e a capo il valore)
+    custom_handles = [
+        # Elemento fittizio trasparente per mostrare il volume iniziale all'inizio dell'elenco
+        Patch(facecolor='none', edgecolor='none', label=f'Initial Liquid (t=0):\n{V_L0:.0f} mL (100.0%)\n'),
+        
+        # Linee reali del grafico coi valori finali calcolati
+        Line2D([0], [0], color=COLOR_LIQUID, lw=4, label=f'Final Free Liquid:\n{fin_liq:.0f} mL ({(fin_liq/V_L0)*100:.1f}%)'),
+        Line2D([0], [0], color=COLOR_BC, lw=4, label=f'Final BC Volume:\n{fin_bc:.0f} mL ({(fin_bc/V_L0)*100:.1f}%)'),
+        Line2D([0], [0], color=COLOR_EVAP, lw=4, label=f'Evap / Consumed:\n{fin_evap:.0f} mL ({(fin_evap/V_L0)*100:.1f}%)')
+    ]
+    
+    # Posizioniamo la legenda fuori dal grafico (bbox_to_anchor a destra dell'asse X)
+    ax1.legend(handles=custom_handles, 
+               loc='center left', 
+               bbox_to_anchor=(1.12, 0.5), # Il primo numero (1.12) la sposta fuori a destra
+               frameon=True, 
+               edgecolor='#BDC3C7', 
+               fontsize=11, 
+               title="Mass Balance Summary", 
+               title_fontproperties={'weight':'bold', 'size':13},
+               labelspacing=1.2) # Più spazio tra una voce e l'altra
+
+    plt.title(f'Kinematic Volumetric Balance: {batch_id} - {batch_label}', fontsize=15, fontweight='bold', y=1.05)
+    
+    # bbox_inches='tight' assicura che il pannello esterno non venga tagliato via quando salvi l'immagine
+    plot_path = os.path.join(output_dir, f"{batch_id}_Lines_model.png")
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+print(f"\n🎉 DONE! Clean dashboard plots generated in '{output_dir}'.")
